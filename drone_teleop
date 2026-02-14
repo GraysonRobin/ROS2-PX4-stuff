@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+import rclpy
+import sys, select, termios, tty
+import math
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleStatus, VehicleOdometry, VehicleRatesSetpoint, VehicleLocalPosition
+
+settings = termios.tcgetattr(sys.stdin)
+qos_profile = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1
+)
+
+class DroneTeleopNode(Node):
+    def __init__(self):
+        super().__init__("drone_teleop")
+        self.get_logger().info("Starting drone teleop controller...")
+
+###  SUBSCRIPTION  ###
+        self.vehicle_status_sub = self.create_subscription(VehicleStatus, "/fmu/out/vehicle_status", self.vehicle_status_callback, qos_profile)
+        self.vehicle_odometry_sub = self.create_subscription(VehicleOdometry, "/fmu/out/vehicle_odometry", self.odometry_callback, qos_profile)
+        self.vehicle_lc_pos_sub = self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position_v1", self.vehicle_lc_pos_callback, qos_profile)
+
+### PUBLICATION ###
+        self.offboard_pub = self.create_publisher(OffboardControlMode, "/fmu/in/offboard_control_mode", qos_profile) # Tells px4 what you are controlling, have to send signal at least 2Hz
+        self.trajectory_pub = self.create_publisher(TrajectorySetpoint, "/fmu/in/trajectory_setpoint", qos_profile)
+        self.vehicle_cmd_pub = self.create_publisher(VehicleCommand, "/fmu/in/vehicle_command", qos_profile)
+        self.vehicle_setpoint_pub = self.create_publisher(VehicleRatesSetpoint, "/fmu/in/vehicle_rates_setpoint", qos_profile)
+
+        self.current_pos = [float('nan'), float('nan'), float('nan')]
+        self.updated_pos = [float('nan'), float('nan'), float('nan')]
+        self.target_yaw = 90*math.pi/180
+        self.target_yaw_deg = lambda: self.target_yaw*180/math.pi
+        self.yaw_step = 3.0*math.pi/180
+        self.get_current_yaw = None
+        self.move_step = 6.0
+        self.speed_fast = 30.0
+        self.speed_slow = 12.0
+
+        self.is_fixedwing = False
+        self.arm_status = False
+
+        self.mapping_dict = {
+            " ": self.drone_arm,
+            "t": self.drone_takeoff,
+            "o": self.start_offboard,
+            "f": self.transition,
+            "w": lambda: [self.move_step*math.cos(self.target_yaw), self.move_step*math.sin(self.target_yaw), 0.0],         #Move forward WRT nose
+            "s": lambda: [-self.move_step*math.cos(self.target_yaw), -self.move_step*math.sin(self.target_yaw), 0.0],       #Move backward WRT nose
+            "a": lambda: [self.move_step*math.sin(self.target_yaw), -self.move_step*math.cos(self.target_yaw), 0.0],        #Move left WRT nose
+            "d": lambda: [-self.move_step*math.sin(self.target_yaw), self.move_step*math.cos(self.target_yaw), 0.0],        #Move right WRT nose, use lambda function to periodically update self.target_yaw
+            "q": -self.yaw_step,
+            "e": self.yaw_step,
+            "\x1b[A": lambda: [0.0, 0.0, -self.move_step],     #UP
+            "\x1b[B": lambda: [0.0, 0.0, self.move_step],     #DOWN
+        }
+
+        self.timer = self.create_timer(0.05, self.loop)
+
+#--------------------------------------------------------CALLBACKS---------------------------------------------------#
+
+    def vehicle_status_callback(self, msg:VehicleStatus):
+        self.vhc_status = msg
+
+    def vehicle_lc_pos_callback(self, msg:VehicleLocalPosition):
+        self.get_current_yaw = float(msg.heading)
+
+    def odometry_callback(self, msg:VehicleOdometry):
+        self.current_pos = [msg.position[0], msg.position[1], msg.position[2]]      #NED Coordinate
+
+#--------------------------------------------------------LOOP--------------------------------------------------------#
+
+    def loop(self):
+        self.get_keyboard_key()
+        self.publish_offboard()
+        if self.updated_pos[0] == self.updated_pos[0]:  
+            self.get_logger().info(f"North: {self.updated_pos[0]:.2f}, East: {self.updated_pos[1]:.2f}, Height: {-self.updated_pos[2]:.2f}, Yaw: {self.target_yaw_deg() % 360:.2f}\nFixed wing status: {self.is_fixedwing}")
+
+    def get_keyboard_key(self):
+        last_key_pressed = None
+        while True:
+            rlist, _, _ = select.select([sys.stdin], [], [], 0)
+            if rlist:
+                key = sys.stdin.read(1)
+
+                if key == '\x03':
+                    self.get_logger().warn("\nCtrl + C detected. Exiting program...")
+                    raise KeyboardInterrupt
+                if key == '\x1b':
+                    extra_key = sys.stdin.read(2)
+                    key += extra_key
+                if key in [" ", "t", "o", "f"]:
+                    self.mapping_dict[key]()
+                elif key in ["\x1b[A", "\x1b[B", "a", "d", "w", "s", "q", "e"]:
+                    last_key_pressed = key
+            else:
+                break
+
+        if last_key_pressed:
+            self.update_action(key=last_key_pressed)
+
+#------------------------------------------------------ACTIONS-----------------------------------------------------------#
+
+    def set_position(self, pos=[float('nan'), float('nan'), float('nan')], vel=[float('nan'), float('nan'), float('nan')], yaw=0):
+        cmd = TrajectorySetpoint()
+        cmd.position = pos
+        cmd.velocity = vel
+        cmd.acceleration = [float('nan'), float('nan'), float('nan')]
+        cmd.yaw = yaw
+        cmd.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        self.trajectory_pub.publish(cmd)
+
+    def update_action(self, key):
+        if not self.is_fixedwing:
+            if key in ["q", "e"]:
+                self.target_yaw += self.mapping_dict[key]
+            else:
+                self.pos_vector = self.mapping_dict[key]()
+                self.updated_pos = [float(self.current_pos[i]) + self.pos_vector[i] for i in range(3)]
+            self.set_position(pos=self.updated_pos, yaw=self.target_yaw)
+        else:
+            thrust = [1.0, 0.0, 0.0]
+            speed = self.speed_fast
+            roll_spd = 0.0
+            if key == "a":
+                print("updating roll")
+                roll_spd = -90.0
+            elif key == "d":
+                print("updating roll")
+                roll_spd = 90.0
+            if key == "w":
+                speed = self.speed_fast
+                thrust = [1.0, 0.0, 0.0]
+            elif key == "s":
+                speed = self.speed_slow
+                thrust = [0.6, 0.0, 0.0]
+            #speed_vector = [speed*math.cos(self.get_current_yaw), speed*math.sin(self.get_current_yaw), 0.0]
+            #self.set_position(vel=speed_vector, yaw=self.get_current_yaw)
+            self.publish_vehicle_sp(roll=roll_spd, yaw=self.get_current_yaw, thrust=thrust)
+
+    def publish_vehicle_sp(self, roll=0.0, pitch=0.0, yaw=0.0, thrust=[0.6, 0.0, 0.0]):
+        cmd = VehicleRatesSetpoint()
+        cmd.roll = roll
+        cmd.pitch = pitch
+        cmd.yaw = yaw
+        cmd.thrust_body = thrust
+        cmd.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        self.vehicle_setpoint_pub.publish(cmd)
+
+    def start_offboard(self):
+        self.helper_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
+        self.get_logger().info("Staring Offboard Mode.")
+
+    def drone_arm(self):
+        if self.arm_status == False:
+            self.helper_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+            self.get_logger().info("Arming Drone.")
+            self.arm_status = True
+        else:
+            self.helper_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0)
+            self.get_logger().info("Disarming Drone.")
+            self.arm_status = False
+
+    def drone_takeoff(self):
+        self.helper_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF, param7=10.0)
+        self.get_logger().info("Taking off to x meters")
+
+    def transition(self):
+        if self.is_fixedwing == False:
+            self.helper_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_VTOL_TRANSITION, param1=4.0)
+            self.is_fixedwing = True
+        else:
+            self.helper_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_VTOL_TRANSITION, param1=3.0)
+            self.is_fixedwing = False
+
+    def helper_vehicle_cmd(self, command, param1=0.0, param2=0.0, param7=0.0):
+        cmd = VehicleCommand()
+        cmd.command = command
+        cmd.param1 = param1
+        cmd.param2 = param2
+        cmd.param7 = param7
+
+        cmd.target_system = 1
+        cmd.target_component = 1
+        cmd.source_system = 1
+        cmd.source_component = 1
+        cmd.from_external = True
+        cmd.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+
+        self.vehicle_cmd_pub.publish(cmd)
+
+    def publish_offboard(self):
+        cmd = OffboardControlMode()
+        cmd.position = True if not self.is_fixedwing else False
+        cmd.velocity = False if not self.is_fixedwing else True
+        cmd.acceleration = False
+        cmd.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        self.offboard_pub.publish(cmd)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DroneTeleopNode()
+    tty.setcbreak(sys.stdin.fileno())
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.get_logger().info("\nExited successfully, restoring terminal interface")
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+        rclpy.shutdown()
