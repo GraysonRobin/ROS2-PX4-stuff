@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from px4_msgs.msg import VehicleOdometry
+import math
+
+class DroneMonitorNode(Node):
+    def __init__(self):
+        super().__init__("drone_monitor")
+        self.get_logger().info("Starting drone monitor...")
+        self.prev_n = None
+        self.prev_e = None
+        self.prev_d = None
+        self.sum_distance = 0
+        self.is_first_iteration = True
+       
+        self.odometry_subscriber_ = self.create_subscription(
+            VehicleOdometry,
+            "/fmu/out/vehicle_odometry",
+            self.odometry_callback,
+            qos_profile_sensor_data
+        )
+
+    def odometry_callback(self, msg: VehicleOdometry):
+        self.cur_n = msg.position[0]
+        self.cur_e = msg.position[1]
+        self.cur_d = abs(msg.position[2])
+        self.speed = math.sqrt(msg.velocity[0]**2 +msg.velocity[1]**2 +msg.velocity[2]**2)
+
+        if self.is_first_iteration:
+            self.prev_n, self.prev_e, self.prev_d = self.cur_n, self.cur_e, self.cur_d
+            self.is_first_iteration = False
+            return
+
+        self.distance = math.sqrt((self.cur_n-self.prev_n)**2 + (self.cur_e-self.prev_e)**2 + (self.cur_d-self.prev_d)**2)
+
+        self.get_logger().info(f"Height: {self.cur_d:.2f} m | Speed:{self.speed:.2f} ms")
+#        if self.cur_d > 4.0:
+#            self.get_logger().warn("[WARNING] High Altitude!")
+#        if self.speed > 5.0:
+#            self.get_logger().warn("[WARNING] Moving Too Fast!")
+        if self.distance > 0.005:
+            self.sum_distance += self.distance
+
+        self.get_logger().info(f"Total Distance: {self.sum_distance:.2f}, distance:{self.distance:.2f}")
+        self.prev_n, self.prev_e, self.prev_d = self.cur_n, self.cur_e, self.cur_d
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DroneMonitorNode()
+    rclpy.spin(node)
+    rclpy.shutdown()
